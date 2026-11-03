@@ -5,6 +5,8 @@ import android.app.Application;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.res.Resources;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
 import android.graphics.drawable.Drawable;
@@ -46,8 +48,16 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "MoMoRev: ";
     private static final boolean DEBUG = true;
 
-    /** 熟知按钮配色：浅蓝，与 认识(绿) / 不确定(黄) / 不认识(红) 区分 */
-    private static final int WELL_COLOR = 0xFF4FC3F7;
+    /**
+     * 熟知按钮配色。
+     *
+     * 原生按钮的配色随主题变化：深色主题是「深底 + 彩色描边 + 彩色文字」，浅色主题是
+     * 「白色填充 + 浅灰描边 + 深色文字」。所以这里按原生文字颜色的明暗挑一组：
+     * - 浅色主题（原生深色字）用深一点的蓝，白底上才看得清
+     * - 深色主题（原生浅色字）沿用原来的浅蓝，和原生描边风格一致
+     */
+    private static final int WELL_COLOR_LIGHT = 0xFF0288D1;
+    private static final int WELL_COLOR_DARK = 0xFF4FC3F7;
     private static final int WELL_FAMILIAR_FALLBACK = 4;
 
     private static final Map<View, Boolean> DONE_BARS = new WeakHashMap<View, Boolean>();
@@ -238,12 +248,18 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         tv.setText(label);
         tv.setTag("momorev_well_familiar");
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, src.getTextSize());
+        float textSize = src.getTextSize();
+        if (textSize <= 0f) {
+            // 极少数情况下这里的 TextView 还没被赋过字号，用 14sp 兜底，避免画出「有底无字」的色块
+            textSize = 14f * res.getDisplayMetrics().scaledDensity;
+            log("src textSize invalid, fallback to " + textSize);
+        }
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, textSize);
         tv.setTypeface(src.getTypeface());
         tv.setGravity(src.getGravity());
         tv.setIncludeFontPadding(true);
         tv.setPadding(src.getPaddingLeft(), src.getPaddingTop(), src.getPaddingRight(), src.getPaddingBottom());
-        tv.setTextColor(WELL_COLOR);
+        tv.setTextColor(WELL_COLOR_DARK);
         tv.setSingleLine(true);
         tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
         tv.setClickable(true);
@@ -274,6 +290,15 @@ public class MainHook implements IXposedHookLoadPackage {
         bar.requestLayout();
         log("4th button injected (" + label + ") fields=" + leftField.getName() + "/" + rightField.getName()
                 + " lp=" + clpClass.getName());
+        tv.post(new Runnable() {
+            @Override
+            public void run() {
+                String textW = tv.getLayout() == null ? "null" : String.valueOf(tv.getLayout().getWidth());
+                log("well button laid out: " + tv.getWidth() + "x" + tv.getHeight()
+                        + " textW=" + textW + " textSize=" + tv.getTextSize()
+                        + " textColor=" + Integer.toHexString(tv.getCurrentTextColor()));
+            }
+        });
         return true;
     }
 
@@ -336,37 +361,239 @@ public class MainHook implements IXposedHookLoadPackage {
         return dst;
     }
 
-    /** 克隆「认识」按钮的背景（圆角描边），染色成蓝色；再自建一个按压态前景 */
+    /**
+     * 克隆「认识」按钮的背景来做熟知按钮。
+     *
+     * 这里有个坑：原生背景随主题不同（墨墨 5.6.05 里认识按钮是 background="?rev_button_familiar"）
+     * - 深色主题 res/drawable-night：透明填充 + 1.2dp 描边。整块 SRC_IN 染色只改描边颜色，
+     *   外观和原生完全一致。
+     * - 浅色主题 res/drawable：实心填充（#82c2ab 圆角，没有描边）。SRC_IN 会把不透明的填充
+     *   一起染成纯蓝，于是得到一个「没有字的蓝色色块」——文字和底色同为蓝色，直接看不见。
+     *   海信 A5 Pro 上就是这个表现。
+     *
+     * 所以先把源 drawable 渲染成小图采样：中间透明的照旧克隆染色；实心的则自绘一个空心按钮。
+     * 填充色刻意不用采样值（它跟随主题/皮肤走，可能是绿色），改成主题无关的淡蓝，保证
+     * 无论在浅色页面还是深色页面上，蓝字都读得清。
+     *
+     * 另外墨水屏设备上墨墨会自己把界面画成黑白（不是模块干的），这时再硬塞蓝色就很突兀，
+     * 所以检测到墨水屏就跟着走黑白：描边/文字用原生文字色、填充透明，靠文字区分第四个按钮。
+     */
     private static void style(TextView tv, TextView src, Resources res) {
         float density = res.getDisplayMetrics().density;
-        int radius = (int) (10f * density + 0.5f);
-        int stroke = Math.max(1, (int) (2f * density + 0.5f));
+        int stroke = Math.max(2, Math.round(1f * density));
 
+        int srcTextColor = 0xFF333333;
+        try {
+            srcTextColor = src.getCurrentTextColor();
+        } catch (Throwable ignored) {
+        }
+        boolean lightTheme = luminance(srcTextColor) < 0.5f;
+        int accent = lightTheme ? WELL_COLOR_LIGHT : WELL_COLOR_DARK;
+        // 实际生效的颜色（墨水屏时会换成黑/深灰），按压态也跟着它走
+        int effective = accent;
+
+        tv.setTextColor(accent);
+        tv.setAlpha(1f);
+
+        Drawable clone = null;
         try {
             Drawable bg = src.getBackground();
             if (bg != null && bg.getConstantState() != null) {
-                Drawable copy = bg.getConstantState().newDrawable(res).mutate();
-                copy.setColorFilter(new PorterDuffColorFilter(WELL_COLOR, PorterDuff.Mode.SRC_IN));
-                tv.setBackground(copy);
-                log("background cloned");
-            } else {
-                tv.setBackground(roundStroke(radius, stroke, WELL_COLOR, 0x00000000));
-                log("background fallback (src bg null)");
+                clone = bg.getConstantState().newDrawable(res).mutate();
             }
         } catch (Throwable t) {
             log("background clone failed: " + t);
-            tv.setBackground(roundStroke(radius, stroke, WELL_COLOR, 0x00000000));
+        }
+
+        Sample s = clone == null ? null : sample(clone, src);
+        // 圆角取 App 自己的 @dimen/r_default（原生按钮 background 就用的它），拿不到再退到采样估算
+        int radius = resolveRadius(res, s != null && s.radius > 0 ? s.radius : Math.round(10f * density));
+
+        if (isEinkDevice(tv.getContext())) {
+            // 墨水屏：App 自己会把界面画成黑白，这里跟着走黑白 —— 描边和文字直接用原生文字色，
+            // 填充透明（露出页面底色），和旁边三个按钮完全同一种观感，靠「熟知」两个字区分
+            int mono = ((srcTextColor >>> 24) & 0xFF) == 0 ? 0xFF4B4C4D : srcTextColor;
+            effective = mono;
+            tv.setTextColor(mono);
+            tv.setBackground(roundStroke(radius, stroke, mono, 0x00000000));
+            log("background mono (eink) accent=" + Integer.toHexString(mono)
+                    + " radius=" + radius + " stroke=" + stroke);
+        } else if (clone != null && s != null && s.centerAlpha < 32) {
+            // 空心描边：保留原生几何，只换描边颜色
+            clone.setColorFilter(new PorterDuffColorFilter(accent, PorterDuff.Mode.SRC_IN));
+            tv.setBackground(clone);
+            log("background cloned (outline, centerAlpha=" + s.centerAlpha + ")");
+        } else {
+            // 实心背景：整块染色会糊成一整块纯色，改成「淡蓝填充 + 蓝色描边」
+            int fill = (accent & 0x00FFFFFF) | 0x1A000000;
+            tv.setBackground(roundStroke(radius, stroke, accent, fill));
+            log("background rebuilt (filled src -> outline) fill=" + Integer.toHexString(fill)
+                    + " srcFill=" + (s == null ? "sample-failed" : Integer.toHexString(s.centerColor))
+                    + " radius=" + radius + " stroke=" + stroke);
         }
 
         try {
             android.graphics.drawable.StateListDrawable fg = new android.graphics.drawable.StateListDrawable();
             fg.addState(new int[]{android.R.attr.state_pressed},
-                    roundStroke(radius, stroke, WELL_COLOR, (WELL_COLOR & 0x00FFFFFF) | 0x1A000000));
+                    roundStroke(radius, stroke, effective, (effective & 0x00FFFFFF) | 0x33000000));
             fg.addState(new int[0], new android.graphics.drawable.ColorDrawable(0x00000000));
             tv.setForeground(fg);
         } catch (Throwable t) {
             log("foreground failed: " + t);
         }
+        log("styled: lightTheme=" + lightTheme + " accent=" + Integer.toHexString(accent)
+                + " srcTextColor=" + Integer.toHexString(srcTextColor));
+    }
+
+    /** 原生按钮圆角来自 @dimen/r_default（4dp），直接读 App 资源最准；读不到才用兜底值 */
+    private static int resolveRadius(Resources res, int fallback) {
+        try {
+            int id = res.getIdentifier("r_default", "dimen", PKG);
+            if (id != 0) {
+                int px = res.getDimensionPixelSize(id);
+                if (px > 0) {
+                    return px;
+                }
+            }
+        } catch (Throwable t) {
+            log("resolve r_default failed: " + t);
+        }
+        return fallback;
+    }
+
+    // ---------------------------------------------------------------- e-ink
+
+    private static volatile Boolean sEink;
+
+    /** 是否墨水屏设备：墨墨自己会把界面转成黑白，模块也跟着转 */
+    private static boolean isEinkDevice(Context ctx) {
+        Boolean cached = sEink;
+        if (cached != null) {
+            return cached.booleanValue();
+        }
+        boolean r = detectEink(ctx);
+        sEink = Boolean.valueOf(r);
+        log("eink device = " + r);
+        return r;
+    }
+
+    private static boolean detectEink(Context ctx) {
+        // 1) 系统属性：各家墨水屏基本都会留 epd / eink 属性（海信是 persist.sys.epd.*）
+        String[] props = {
+                "persist.sys.epd.black", "persist.sys.epd.contrast", "persist.sys.epd.mode",
+                "ro.eink.enable", "ro.eink", "ro.hisense.eink", "ro.epd.version",
+                "persist.sys.eink", "sys.eink.enable"
+        };
+        for (String key : props) {
+            String v = sysProp(key);
+            if (v != null && v.length() > 0 && !"0".equals(v) && !"false".equalsIgnoreCase(v)) {
+                log("eink by prop " + key + "=" + v);
+                return true;
+            }
+        }
+        // 2) 墨水屏桌面：海信 / Onyx Boox / 文石 / Meebook 等
+        String[] pkgs = {
+                "com.hmct.einklauncher", "com.onyx", "com.onyx.android",
+                "com.boox.boox", "com.meebook.launcher", "com.ireader.launcher"
+        };
+        try {
+            android.content.pm.PackageManager pm = ctx.getPackageManager();
+            for (String p : pkgs) {
+                try {
+                    pm.getPackageInfo(p, 0);
+                    log("eink by package " + p);
+                    return true;
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private static String sysProp(String key) {
+        try {
+            Class<?> c = Class.forName("android.os.SystemProperties");
+            Method get = c.getMethod("get", String.class);
+            Object v = get.invoke(null, key);
+            return v instanceof String ? (String) v : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 采样结果：中间像素（判断空/实心）+ 圆角半径 */
+    private static final class Sample {
+        int centerColor;
+        int centerAlpha;
+        int radius;
+    }
+
+    /** 把背景 drawable 画到一张小图上量尺寸；失败返回 null（调用方走默认值） */
+    private static Sample sample(Drawable d, View src) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        final boolean sized = w > 0 && h > 0;
+        if (!sized) {
+            w = 160;
+            h = 96;
+        }
+        Bitmap bmp = null;
+        try {
+            bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            d.setBounds(0, 0, w, h);
+            d.draw(new Canvas(bmp));
+            Sample s = new Sample();
+            int center = bmp.getPixel(w / 2, h / 2);
+            s.centerColor = center;
+            s.centerAlpha = (center >>> 24) & 0xFF;
+            if (sized) {
+                s.radius = cornerRadius(bmp);
+            }
+            return s;
+        } catch (Throwable t) {
+            log("sample background failed: " + t);
+            return null;
+        } finally {
+            if (bmp != null) {
+                try {
+                    bmp.recycle();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    /** 上边/左边第一个不透明像素的偏移量 ≈ 圆角半径 */
+    private static int cornerRadius(Bitmap b) {
+        int w = b.getWidth();
+        int h = b.getHeight();
+        int x0 = -1;
+        int y0 = -1;
+        for (int x = 0; x < w; x++) {
+            if (((b.getPixel(x, 0) >>> 24) & 0xFF) > 32) {
+                x0 = x;
+                break;
+            }
+        }
+        for (int y = 0; y < h; y++) {
+            if (((b.getPixel(0, y) >>> 24) & 0xFF) > 32) {
+                y0 = y;
+                break;
+            }
+        }
+        if (x0 <= 0 || y0 <= 0) {
+            return 0;
+        }
+        return Math.min(Math.max(x0, y0), h / 2);
+    }
+
+    /** 只用来判断原生文字是「深底浅字」还是「浅底深字」，不需要严格公式 */
+    private static float luminance(int color) {
+        float r = (color >> 16) & 0xFF;
+        float g = (color >> 8) & 0xFF;
+        float b = color & 0xFF;
+        return (0.299f * r + 0.587f * g + 0.114f * b) / 255f;
     }
 
     private static GradientDrawable roundStroke(int radius, int stroke, int color, int fill) {

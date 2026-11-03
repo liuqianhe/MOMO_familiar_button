@@ -19,3 +19,6 @@ Thumbs.db
 
 # 日志
 *.log
+
+# 本地 agent / 调试临时目录
+.workbuddy/

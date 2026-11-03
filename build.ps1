@@ -14,6 +14,11 @@ $ErrorActionPreference = "Stop"
 $AppDir = Join-Path $PSScriptRoot "app"
 $StubDir = Join-Path $PSScriptRoot "stubs"
 
+# 版本号只在 AndroidManifest.xml 里维护，这里读出来传给 aapt2，避免两处不一致
+$manifestRaw = Get-Content "$AppDir\AndroidManifest.xml" -Raw
+$versionCode = if ($manifestRaw -match 'android:versionCode="(\d+)"') { $Matches[1] } else { "1" }
+$versionName = if ($manifestRaw -match 'android:versionName="([^"]+)"') { $Matches[1] } else { "1.0" }
+
 if (-not (Test-Path "$JdkHome\bin\javac.exe")) {
     $cand = Get-ChildItem "C:\AndroidDev" -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like "jdk*" } | Select-Object -First 1
@@ -44,7 +49,7 @@ Write-Host "==> 2/7 aapt2 link" -ForegroundColor Cyan
     -A "$AppDir\assets" `
     --java "$OutDir\gen" `
     --min-sdk-version 24 --target-sdk-version 34 `
-    --version-code 1 --version-name 1.0
+    --version-code $versionCode --version-name $versionName
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
 Write-Host "==> 3/7 javac" -ForegroundColor Cyan
