@@ -1,5 +1,7 @@
 # 墨墨熟知按钮 (MOMO_familiar_button)
 
+<img src="docs/icon.png" width="96" alt="模块图标">
+
 一个 LSPosed 模块：把墨墨背单词页面底部的 **三个** 按钮
 `认识 / 不确定 / 不认识` 变成 **四个**
 `认识 / 熟知 / 不确定 / 不认识`。
@@ -51,6 +53,11 @@
 版本号只在 `app/AndroidManifest.xml` 里维护，`build.ps1` 会读出来传给 aapt2。
 
 ## 更新日志
+
+### v1.2
+
+- 新增模块图标：猫头鹰 + 四个按钮（第二个实心），纯黑白，替代系统默认的安卓小人图标
+- 图标提供 mdpi ~ xxxhdpi 五套密度
 
 ### v1.1
 
